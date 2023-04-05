@@ -15,5 +15,14 @@
   "bugs": {
     "url": "https://github.com/jarrodli/SolidityDutchAuction/issues"
   },
-  "homepage": "https://github.com/jarrodli/SolidityDutchAuction#readme"
+  "homepage": "https://github.com/jarrodli/SolidityDutchAuction#readme",
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.8.2",
+    "eth-gas-reporter": "^0.2.25",
+    "ganache": "^7.7.7",
+    "truffle": "^5.8.1"
+  },
+  "devDependencies": {
+    "@openzeppelin/test-helpers": "^0.5.16"
+  }
 }
