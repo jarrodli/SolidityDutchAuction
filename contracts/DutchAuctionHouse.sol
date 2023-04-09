@@ -7,6 +7,9 @@ import "@openzeppelin/contracts/token/ERC20/presets/ERC20PresetFixedSupply.sol";
 contract DutchAuctionHouse {
     event SellID(uint orderId);
     event BuyID(uint orderId);
+    event ByteDebug(bytes32 b);
+    event SigDebug(Signature s);
+    event AddrDebug(address a);
 
     enum Modes {
         DepositWithdrawl,
@@ -16,7 +19,8 @@ contract DutchAuctionHouse {
     }
 
     enum OP {
-        Buy,
+        PlaceBuy,
+        WithdrawBuy,
         Sell,
         Account,
         Global
@@ -27,6 +31,7 @@ contract DutchAuctionHouse {
         uint debtAccrued; // total amount of possible debt owing
         mapping(address => uint) tokens; // owned tokens
         bool exists; // flag for existence
+        bytes32 publicKey; // public key for validating ops
     }
 
     // Buy Orders exist on the buySideExchange.
@@ -48,13 +53,21 @@ contract DutchAuctionHouse {
         Genesis
     }
 
+    struct Signature {
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+    }
+
     // A Buy Order can be a blind bid or an open bid.
     // Buy Orders exist on the buySideExchange.
     struct BuyOrder {
         uint id;
         address owner;
         bytes32 blindBid;
+        Signature signature;
         OrderStatus status;
+        bool signed;
         bool exists;
         // open bid state variables
         address token;
@@ -71,7 +84,7 @@ contract DutchAuctionHouse {
 
     // Util consts
     address private constant NONE_ADDR = address(0x0);
-    bytes32 private constant NONE_BID = bytes32(0x0);
+    bytes32 private constant NONE_BYTES = bytes32(0x0);
     uint private constant NONE = 0;
     uint private constant GENESIS = 0;
 
@@ -141,10 +154,23 @@ contract DutchAuctionHouse {
                 sellSideExchange[sellSideIndex[_id]][_id].owner == _account,
                 "User has no sell order with corresponding id. Action not allowed."
             );
-        } else {
+        } else if (!buySideExchange[_id].signed) {
+            // only require buy order ownership if order is not signed
             require(
                 buySideExchange[_id].owner == _account,
                 "User has no buy order with corresponding id. Action not allowed."
+            );
+        } else {
+            // validate signature.
+            bytes memory prefix = "\x19Ethereum Signed Message:\n32";
+            bytes32 prefixedHash = keccak256(
+                abi.encodePacked(prefix, buySideExchange[_id].blindBid)
+            );
+            Signature memory s = buySideExchange[_id].signature;
+
+            require(
+                _account == ecrecover(prefixedHash, s.v, s.r, s.s),
+                "Signature recovery failure. Cannot operate on another users bid."
             );
         }
 
@@ -155,7 +181,8 @@ contract DutchAuctionHouse {
         require(
             ((_operation == OP.Account && !accountLock) ||
                 (_operation == OP.Sell && !sellLock)) ||
-                (_operation == OP.Buy && !buyLock) ||
+                ((_operation == OP.PlaceBuy || _operation == OP.WithdrawBuy) &&
+                    !buyLock) ||
                 (_operation == OP.Global && !(sellLock && buyLock)),
             "Cannot acquire lock. Operation failure."
         );
@@ -167,6 +194,18 @@ contract DutchAuctionHouse {
         Account storage acc = userAccounts[msg.sender];
         acc.balance = 0;
         acc.exists = true;
+
+        handle_deposit_funds(msg.sender, msg.value);
+    }
+
+    /// Creates an account.
+    function create_pk_account(
+        bytes32 _key
+    ) public payable require_unique(msg.sender) {
+        Account storage acc = userAccounts[msg.sender];
+        acc.balance = 0;
+        acc.exists = true;
+        acc.publicKey = _key;
 
         handle_deposit_funds(msg.sender, msg.value);
     }
@@ -360,26 +399,34 @@ contract DutchAuctionHouse {
     /// Creates a blind buy order.
     /// @param _bid a blind keccak256 hashed bid
     function buy(
-        bytes32 _bid
+        bytes32 _bid,
+        bool _isSigned,
+        uint8 _v,
+        bytes32 _r,
+        bytes32 _s
     )
         public
         during(Modes.BidOpening)
         require_account(msg.sender)
-        require_mutex(OP.Buy)
+        require_mutex(OP.PlaceBuy)
     {
-        acquire_lock(OP.Buy);
+        acquire_lock(OP.PlaceBuy);
         BuyOrder memory currBuy = buySideExchange[buyOrderId];
-        uint thisOrderId = seek_order_id(OP.Buy);
+        uint thisOrderId = seek_order_id(OP.PlaceBuy);
 
         buySideExchange[thisOrderId] = BuyOrder(
             thisOrderId,
             msg.sender,
             _bid,
+            _isSigned
+                ? Signature(_v, _r, _s)
+                : Signature(0, NONE_BYTES, NONE_BYTES),
             OrderStatus.Closed,
+            _isSigned,
             true,
             NONE_ADDR,
-            0,
-            0,
+            NONE,
+            NONE,
             currBuy.id,
             buySideExchange[currBuy.next].id
         );
@@ -389,7 +436,7 @@ contract DutchAuctionHouse {
         // update prev node to point to curr
         buySideExchange[currBuy.id].next = thisOrderId;
         buyOrderId = thisOrderId;
-        release_lock(OP.Buy);
+        release_lock(OP.PlaceBuy);
 
         emit BuyID(thisOrderId);
     }
@@ -402,15 +449,15 @@ contract DutchAuctionHouse {
         public
         during(Modes.BidOpening)
         require_account(msg.sender)
-        require_mutex(OP.Buy)
-        require_order_ownership(OP.Buy, msg.sender, _id)
+        require_mutex(OP.WithdrawBuy)
+        require_order_ownership(OP.WithdrawBuy, msg.sender, _id)
     {
         userAccounts[msg.sender].debtAccrued -=
             buySideExchange[_id].amount *
             buySideExchange[_id].price;
-        acquire_lock(OP.Buy);
-        handle_remove_order(OP.Buy, _id);
-        release_lock(OP.Buy);
+        acquire_lock(OP.WithdrawBuy);
+        handle_remove_order(OP.WithdrawBuy, _id);
+        release_lock(OP.WithdrawBuy);
     }
 
     function open_buy_order(
@@ -423,10 +470,13 @@ contract DutchAuctionHouse {
         public
         during(Modes.BidOpening)
         require_account(msg.sender)
-        require_mutex(OP.Buy)
-        require_order_ownership(OP.Buy, msg.sender, _id)
+        require_mutex(OP.PlaceBuy)
+        require_order_ownership(OP.PlaceBuy, msg.sender, _id)
     {
-        // Check purported bid matches blind bid.
+        // check if the bid was signed.
+        if (buySideExchange[_id].signed) {}
+
+        // check purported bid matches blind bid.
         bytes32 verifiedBid = keccak256(
             abi.encodePacked(_token, _price, _amount, _nonce)
         );
@@ -436,7 +486,7 @@ contract DutchAuctionHouse {
             "Buy order missmatch. Cannot open diverging bid."
         );
 
-        // Check account has enough funds to meet open bid.
+        // check account has enough funds to meet open bid.
         require(
             _price * _amount <=
                 userAccounts[msg.sender].balance -
@@ -446,14 +496,14 @@ contract DutchAuctionHouse {
 
         userAccounts[msg.sender].debtAccrued += _price * _amount;
 
-        acquire_lock(OP.Buy);
+        acquire_lock(OP.PlaceBuy);
 
         buySideExchange[_id].token = _token;
         buySideExchange[_id].price = _price;
         buySideExchange[_id].amount = _amount;
         buySideExchange[_id].status = OrderStatus.Open;
 
-        release_lock(OP.Buy);
+        release_lock(OP.PlaceBuy);
     }
 
     /// Begins the matching phase between market participants.
@@ -578,7 +628,7 @@ contract DutchAuctionHouse {
     function acquire_lock(OP _operation) internal {
         if (_operation == OP.Sell) {
             sellLock = true;
-        } else if (_operation == OP.Buy) {
+        } else if (_operation == OP.PlaceBuy || _operation == OP.WithdrawBuy) {
             buyLock = true;
         } else if (_operation == OP.Account) {
             accountLock = true;
@@ -595,7 +645,7 @@ contract DutchAuctionHouse {
     function release_lock(OP _operation) internal {
         if (_operation == OP.Sell) {
             sellLock = false;
-        } else if (_operation == OP.Buy) {
+        } else if (_operation == OP.PlaceBuy || _operation == OP.WithdrawBuy) {
             buyLock = false;
         } else if (_operation == OP.Account) {
             accountLock = false;
@@ -614,7 +664,7 @@ contract DutchAuctionHouse {
     /// the volume of transactions through this Auction House.
     /// @return an index
     function seek_order_id(OP _operation) internal view returns (uint) {
-        bool buyOp = _operation == OP.Buy;
+        bool buyOp = _operation == OP.PlaceBuy || _operation == OP.WithdrawBuy;
         uint orderId = buyOp ? buyOrderId : sellOrderId;
         bool found = false;
         bool cycled = false;
@@ -671,7 +721,7 @@ contract DutchAuctionHouse {
                                 NONE
                             );
                             handle_remove_order(OP.Sell, currSell.id);
-                            handle_remove_order(OP.Buy, currBuy.id);
+                            handle_remove_order(OP.WithdrawBuy, currBuy.id);
                             // current buy order fulfiled; continue to next order
                             break;
                         }
@@ -689,7 +739,7 @@ contract DutchAuctionHouse {
                             );
                             sellSideExchange[currBuy.token][currSell.id]
                                 .amount -= currBuy.amount;
-                            handle_remove_order(OP.Buy, currBuy.id);
+                            handle_remove_order(OP.WithdrawBuy, currBuy.id);
                             break;
                         }
                         if (currBuy.amount > currSell.amount) {
