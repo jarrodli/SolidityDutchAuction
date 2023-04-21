@@ -4,12 +4,23 @@ const DutchAuctionHouse = artifacts.require("DutchAuctionHouse");
 const ERC20PresetFixedSupply = artifacts.require("ERC20PresetFixedSupply");
 
 contract("DutchAuctionHouse", (accounts) => {
+    const NONE = 0;
+    const NONE_BYTES = web3.eth.abi.encodeParameter("uint", String(NONE));
+
     let Exchange;
     let ERC20Instance;
+
+    const privateKeys = [
+        "0x5c7a050c7b0e3a6896e9667a6dff3a6b389c665aaed218c352071890c05520ee",
+    ];
 
     it("should setup the account state correctly", async () => {
         // create a Dutch Auction House
         Exchange = await DutchAuctionHouse.deployed();
+        // // setup pki
+        // acc0 = await web3.eth.accounts.create();
+        // acc1 = await web3.eth.accounts.create();
+
         // create a wealthy observer account
         await Exchange.create_account({ from: accounts[0], value: 100000 });
         // create a primary buyer account (buyer 1)
@@ -33,12 +44,6 @@ contract("DutchAuctionHouse", (accounts) => {
         // distribute ERC20 token to sellers
         ERC20Instance.transfer(accounts[3], 500000);
         ERC20Instance.transfer(accounts[4], 250000);
-
-        console.log(`Account 0 addr: ${accounts[0]}`);
-        console.log(`Exchange addr: ${Exchange.address}`);
-        console.log(`ERC20Instance addr: ${ERC20Instance.address}`);
-
-        return assert.isTrue(true);
     });
 
     it("should handle account creation correctly", async () => {
@@ -52,9 +57,14 @@ contract("DutchAuctionHouse", (accounts) => {
         return assert.isTrue(balance == 100000);
     });
 
-    it("should handle eth deposits and withdrawal correctly", async () => {
+    it("should handle ETH deposits and withdrawal correctly", async () => {
         await expectRevert(
             Exchange.deposit_funds({ from: accounts[7], value: 1000 }),
+            "Account payable does not exist. Action not allowed."
+        );
+
+        await expectRevert(
+            Exchange.withdraw_funds(accounts[7], 0, { from: accounts[7] }),
             "Account payable does not exist. Action not allowed."
         );
 
@@ -101,7 +111,7 @@ contract("DutchAuctionHouse", (accounts) => {
         return assert.isTrue(test1 && test2 && test3 && test0);
     });
 
-    it("should handle place and withdraw sell order correctly", async () => {
+    it("should handle place and withdraw sell orders correctly", async () => {
         await expectRevert(
             Exchange.sell(ERC20Instance.address, 250000, 1, {
                 from: accounts[3],
@@ -143,7 +153,7 @@ contract("DutchAuctionHouse", (accounts) => {
         });
     });
 
-    it("should handle place, withdraw and reveal buy order correctly", async () => {
+    it("should handle place, withdraw and reveal buy orders correctly", async () => {
         const failingBlindBid = web3.utils.soliditySha3(
             ERC20Instance.address,
             1000000,
@@ -151,7 +161,14 @@ contract("DutchAuctionHouse", (accounts) => {
             2
         );
 
-        const tx0 = await Exchange.buy(failingBlindBid, { from: accounts[1] });
+        const tx0 = await Exchange.buy(
+            failingBlindBid,
+            false,
+            NONE,
+            NONE_BYTES,
+            NONE_BYTES,
+            { from: accounts[1] }
+        );
         const transaction0ID = tx0.receipt.logs[0].args[0];
 
         await expectRevert(
@@ -185,7 +202,14 @@ contract("DutchAuctionHouse", (accounts) => {
             2
         );
 
-        const tx1 = await Exchange.buy(passingBlindBid, { from: accounts[1] });
+        const tx1 = await Exchange.buy(
+            passingBlindBid,
+            false,
+            NONE,
+            NONE_BYTES,
+            NONE_BYTES,
+            { from: accounts[1] }
+        );
         const transaction1ID = tx1.receipt.logs[0].args[0];
 
         await Exchange.deposit_funds({ from: accounts[1], value: 100 });
@@ -211,7 +235,7 @@ contract("DutchAuctionHouse", (accounts) => {
         await Exchange.withdraw_funds(accounts[1], 100, { from: accounts[1] });
     });
 
-    it("should handle matching buy and sell offers successfully", async () => {
+    it("should handle matching buy and sell orders successfully", async () => {
         // move tokens to seller accounts
         await ERC20Instance.approve(Exchange.address, 5, { from: accounts[3] });
         await Exchange.deposit_token(ERC20Instance.address, 5, {
@@ -255,11 +279,32 @@ contract("DutchAuctionHouse", (accounts) => {
         );
 
         // place buy orders
-        const tx2 = await Exchange.buy(blindBid0, { from: accounts[1] });
+        const tx2 = await Exchange.buy(
+            blindBid0,
+            false,
+            NONE,
+            NONE_BYTES,
+            NONE_BYTES,
+            { from: accounts[1] }
+        );
         const transaction2ID = tx2.receipt.logs[0].args[0];
-        const tx3 = await Exchange.buy(blindBid1, { from: accounts[2] });
+        const tx3 = await Exchange.buy(
+            blindBid1,
+            false,
+            NONE,
+            NONE_BYTES,
+            NONE_BYTES,
+            { from: accounts[2] }
+        );
         const transaction3ID = tx3.receipt.logs[0].args[0];
-        const tx4 = await Exchange.buy(blindBid2, { from: accounts[2] });
+        const tx4 = await Exchange.buy(
+            blindBid2,
+            false,
+            NONE,
+            NONE_BYTES,
+            NONE_BYTES,
+            { from: accounts[2] }
+        );
         const transaction4ID = tx4.receipt.logs[0].args[0];
 
         // deposit ETH
@@ -340,5 +385,73 @@ contract("DutchAuctionHouse", (accounts) => {
             Exchange.withdraw_funds(accounts[4], 1, { from: accounts[4] }),
             "Insufficient balance. Action not allowed."
         );
+    });
+
+    it("should handle third party blind-bids", async () => {
+        const blindBid = await web3.utils.soliditySha3(
+            ERC20Instance.address,
+            10,
+            10,
+            2
+        );
+
+        // create a signedBlindBid from wealthy observer who previously
+        // did not wish to participate on account of their wealth
+        const sig = await web3.eth.accounts.sign(blindBid, privateKeys[0]);
+
+        // test that the privateKey is truly private -- it is not an account address
+        assert.isTrue(privateKeys[0] != accounts[0]);
+
+        // test recover works locally
+        assert.isTrue(
+            web3.eth.accounts.recover(blindBid, sig.signature) == accounts[0]
+        );
+
+        await Exchange.deposit_funds({ from: accounts[0], value: 100 });
+
+        // place buy order with a different account
+        const tx0 = await Exchange.buy(blindBid, true, sig.v, sig.r, sig.s, {
+            from: accounts[1],
+        });
+        const transaction0ID = tx0.receipt.logs[0].args[0];
+
+        // attempt opening buy order with wrong account
+        await expectRevert(
+            Exchange.open_buy_order(
+                transaction0ID,
+                ERC20Instance.address,
+                10,
+                10,
+                2,
+                { from: accounts[1] }
+            ),
+            "Signature recovery failure. Cannot operate on another users bid."
+        );
+
+        // open buy order with correct account
+        await Exchange.open_buy_order(
+            transaction0ID,
+            ERC20Instance.address,
+            10,
+            10,
+            2,
+            { from: accounts[0] }
+        );
+
+        // withdraw the buy order
+        await expectRevert(
+            Exchange.withdraw_buy_order(transaction0ID, {
+                from: accounts[1],
+            }),
+            "Signature recovery failure. Cannot operate on another users bid."
+        );
+
+        // withdraw the buy order
+        await Exchange.withdraw_buy_order(transaction0ID, {
+            from: accounts[0],
+        });
+
+        // cleanup
+        await Exchange.withdraw_funds(accounts[0], 100, { from: accounts[0] });
     });
 });
